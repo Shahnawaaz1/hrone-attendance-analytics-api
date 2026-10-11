@@ -13,20 +13,29 @@ from decimal import Decimal, ROUND_HALF_UP
 import bson.json_util as json_util
 import json
 
-load_dotenv()
+from bson.son import SON
+
+load_dotenv(override=False)
 
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def init_db_indexes():
     # Create indexes idempotently at startup
     db.employees.create_index("emp_code", unique=True)
-    db.attendance_logs.create_index([("emp_code", pymongo.ASCENDING), ("date", pymongo.ASCENDING)], unique=True)
     db.employees.create_index("department")
+    db.employees.create_index("joined_on")
+    db.employees.create_index([("department", pymongo.ASCENDING), ("joined_on", pymongo.ASCENDING)])
+    db.attendance_logs.create_index([("emp_code", pymongo.ASCENDING), ("date", pymongo.ASCENDING)], unique=True)
+    db.attendance_logs.create_index([("date", pymongo.DESCENDING), ("emp_code", pymongo.ASCENDING)])
     db.attendance_logs.create_index("date")
+    db.attendance_logs.create_index([("date", pymongo.ASCENDING), ("late_minutes", pymongo.ASCENDING)])
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db_indexes()
     yield
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
@@ -37,18 +46,28 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 def truncate_to_seconds(dt: datetime) -> datetime:
     return dt.replace(microsecond=0)
 
-def to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
+def to_epoch_ms(dt: Optional[object]) -> Optional[int]:
     if dt is None:
         return None
+    if isinstance(dt, dict) and "$date" in dt:
+        dt = dt["$date"]
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+    if isinstance(dt, (int, float)):
+        return int(dt)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
 
-def make_aware(dt: Optional[datetime]) -> Optional[datetime]:
+def make_aware(dt: Optional[object]) -> Optional[datetime]:
     if dt is None:
         return None
+    if isinstance(dt, dict) and "$date" in dt:
+        dt = dt["$date"]
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
 def get_attendance_date(punch_in_ist: datetime, shift_start: str, shift_end: str) -> str:
@@ -63,8 +82,10 @@ def compute_late_minutes(punch_in_ist: datetime, shift_start: str, attendance_da
     h, m = map(int, shift_start.split(":"))
     ad = datetime_date.fromisoformat(attendance_date_str)
     start_dt = datetime(ad.year, ad.month, ad.day, h, m, tzinfo=IST)
-    minutes = int((punch_in_ist - start_dt).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+    elapsed_seconds = (punch_in_ist - start_dt).total_seconds()
+    if elapsed_seconds > 600:
+        return int(elapsed_seconds // 60)
+    return 0
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     seconds = Decimal(str((punch_out - punch_in).total_seconds()))
@@ -93,44 +114,48 @@ def format_attendance_doc(doc: dict) -> dict:
     doc.pop("id", None)
     doc["punch_in"] = to_epoch_ms(doc.get("punch_in"))
     doc["punch_out"] = to_epoch_ms(doc.get("punch_out"))
+    doc["late_minutes"] = doc.get("late_minutes", 0)
+    doc["overtime_minutes"] = doc.get("overtime_minutes", 0)
+    doc["half_day"] = doc.get("half_day", False) if doc.get("half_day") is not None else False
     
-    for entry in doc.get("history", []):
+    history = doc.get("history") or []
+    for entry in history:
         entry["at"] = to_epoch_ms(entry.get("at"))
         changes = entry.get("changes", {})
         for field in ["punch_in", "punch_out"]:
             if field in changes:
                 changes[field]["from"] = to_epoch_ms(changes[field].get("from"))
                 changes[field]["to"] = to_epoch_ms(changes[field].get("to"))
-                
+    doc["history"] = history
     return doc
 
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
+    emp_code: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1, max_length=100)
+    email: str = Field(..., max_length=120)
+    department: str = Field(..., min_length=1, max_length=50)
     shift_start: str = "09:30"
     shift_end: str = "18:30"
-    joined_on: str
+    joined_on: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
+    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000, strict=True)
     status: str = "PRESENT"
 
 class PunchOutIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
+    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000, strict=True)
 
 class RegularizeIn(BaseModel):
     reason: str = Field(..., min_length=5, max_length=200)
     regularized_by: str = Field(..., min_length=1, max_length=50)
-    status: Optional[str] = None
-    punch_in: Optional[int] = None
-    punch_out: Optional[int] = None
+    status: Optional[str] = Field(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$")
+    punch_in: Optional[int] = Field(None, ge=100000000000, le=4102444800000, strict=True)
+    punch_out: Optional[int] = Field(None, ge=100000000000, le=4102444800000, strict=True)
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -158,7 +183,11 @@ def create_employee(body: EmployeeIn):
     return format_employee_doc(doc)
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100)
+):
     q = {}
     if department:
         q["department"] = department
@@ -211,11 +240,11 @@ def punch_in(body: PunchInIn):
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    status: Optional[str] = Query(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, detail=[{"loc": ["query", "date_from"], "msg": "date_from > date_to", "type": "value_error"}])
@@ -269,7 +298,10 @@ def get_working_days_in_month(month_str: str, joined_on_str: str) -> int:
     return count
 
 @app.get("/analytics/employees/{emp_code}/monthly")
-def employee_monthly(emp_code: str, month: str):
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+):
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(404, detail="Employee not found")
@@ -342,7 +374,10 @@ def employee_monthly(emp_code: str, month: str):
     }
 
 @app.get("/analytics/departments/summary")
-def department_summary(month: str, department: Optional[str] = None):
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None
+):
     start_date, end_date = get_month_boundaries(month)
     
     emp_match = {"joined_on": {"$lte": end_date}}
@@ -433,7 +468,11 @@ def department_summary(month: str, department: Optional[str] = None):
     return {"month": month, "items": items}
 
 @app.get("/analytics/leaderboard/late")
-def late_leaderboard(month: str, limit: int = 10, department: Optional[str] = None):
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None
+):
     start_date, end_date = get_month_boundaries(month)
     
     emp_match = {}
@@ -487,33 +526,28 @@ def late_leaderboard(month: str, limit: int = 10, department: Optional[str] = No
     return {"month": month, "items": items}
 
 @app.get("/analytics/departments/{department}/trend")
-def department_trend(department: str, from_date: str, to_date: str):
-    from fastapi import Query
-    if from_date > to_date:
-        raise HTTPException(422, detail="from_date > to_date")
-    f_dt = datetime_date.fromisoformat(from_date)
-    t_dt = datetime_date.fromisoformat(to_date)
+def department_trend(
+    department: str,
+    from_date: Optional[str] = Query(None, alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_date: Optional[str] = Query(None, alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    from_alt: Optional[str] = Query(None, alias="from_date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_alt: Optional[str] = Query(None, alias="to_date", pattern=r"^\d{4}-\d{2}-\d{2}$")
+):
+    f_date = from_date or from_alt
+    t_date = to_date or to_alt
+    if not f_date or not t_date:
+        raise HTTPException(422, detail=[{"loc": ["query"], "msg": "Missing required 'from' or 'to' query parameter", "type": "value_error"}])
+    if f_date > t_date:
+        raise HTTPException(422, detail=[{"loc": ["query", "to"], "msg": "to must be on or after from", "type": "value_error"}])
+    f_dt = datetime_date.fromisoformat(f_date)
+    t_dt = datetime_date.fromisoformat(t_date)
     if (t_dt - f_dt).days > 92:
-        raise HTTPException(422, detail="range exceeds 92 days")
+        raise HTTPException(422, detail=[{"loc": ["query"], "msg": "range exceeds 92 days", "type": "value_error"}])
         
     # verify department exists
     if not db.employees.find_one({"department": department}):
         raise HTTPException(404, detail="Department not found")
 
-    # This pipeline is highly complex. We will use densify.
-    pipeline = [
-        # First, match all employees in the department to count daily headcount
-        # But we need dates. $densify can create a sequence of dates.
-        # Alternatively, generate the date sequence in Python, then do queries.
-        # Requirement: "use a gap-filling stage such as $densify; do not loop in Python"
-        # Since we must return exactly one row per calendar day, we can start from attendance_logs,
-        # match the department, densify, then lookup.
-    ]
-    
-    # We will build a pipeline that uses $documents to seed the date range,
-    # then $lookup to employees to get headcount, and $lookup to attendance to get present/late.
-    # $documents is available in MongoDB 5.1+, the assignment assumes MongoDB 6.0+.
-    # Or we can just query the data and aggregate.
     pipeline = [
         {"$documents": [{"dummy": 1}]},
         {"$densify": {
@@ -521,7 +555,7 @@ def department_trend(department: str, from_date: str, to_date: str):
             "range": {
                 "step": 1,
                 "unit": "day",
-                "bounds": [datetime.fromisoformat(from_date), datetime.fromisoformat(to_date) + timedelta(days=1)]
+                "bounds": [datetime.fromisoformat(f_date), datetime.fromisoformat(t_date) + timedelta(days=1)]
             }
         }},
         {"$match": {"date_obj": {"$type": "date"}}},
@@ -643,14 +677,16 @@ def department_trend(department: str, from_date: str, to_date: str):
 def explain_endpoint(
     endpoint: str,
     emp_code: Optional[str] = None,
-    month: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
     department: Optional[str] = None,
     limit: Optional[int] = Query(10, ge=1, le=50),
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    from_date: Optional[str] = Query(None, alias="from"),
-    to_date: Optional[str] = Query(None, alias="to"),
+    date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    status: Optional[str] = Query(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$"),
+    from_date: Optional[str] = Query(None, alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_date: Optional[str] = Query(None, alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    from_alt: Optional[str] = Query(None, alias="from_date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_alt: Optional[str] = Query(None, alias="to_date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
     page: Optional[int] = Query(1, ge=1),
     page_size: Optional[int] = Query(20, ge=1, le=100)
 ):
@@ -723,12 +759,15 @@ def explain_endpoint(
                 }
             }}
         ]
-        explain = db.command({
-            "aggregate": collection,
-            "pipeline": pipeline,
-            "explain": True,
-            "cursor": {}
-        })
+        cmd = SON([
+            ("explain", SON([
+                ("aggregate", collection),
+                ("pipeline", pipeline),
+                ("cursor", {})
+            ])),
+            ("verbosity", "executionStats")
+        ])
+        explain = db.command(cmd)
         
     elif endpoint == "department_summary":
         if not month:
@@ -794,12 +833,15 @@ def explain_endpoint(
             }},
             {"$sort": {"_id": 1}}
         ]
-        explain = db.command({
-            "aggregate": collection,
-            "pipeline": pipeline,
-            "explain": True,
-            "cursor": {}
-        })
+        cmd = SON([
+            ("explain", SON([
+                ("aggregate", collection),
+                ("pipeline", pipeline),
+                ("cursor", {})
+            ])),
+            ("verbosity", "executionStats")
+        ])
+        explain = db.command(cmd)
         
     elif endpoint == "late_leaderboard":
         if not month:
@@ -836,15 +878,20 @@ def explain_endpoint(
             {"$match": {"rank": {"$lte": limit}}},
             {"$sort": {"total_late_minutes": -1, "_id": 1}}
         ])
-        explain = db.command({
-            "aggregate": collection,
-            "pipeline": pipeline,
-            "explain": True,
-            "cursor": {}
-        })
+        cmd = SON([
+            ("explain", SON([
+                ("aggregate", collection),
+                ("pipeline", pipeline),
+                ("cursor", {})
+            ])),
+            ("verbosity", "executionStats")
+        ])
+        explain = db.command(cmd)
         
     elif endpoint == "department_trend":
-        if not department or not from_date or not to_date:
+        f_date = from_date or from_alt
+        t_date = to_date or to_alt
+        if not department or not f_date or not t_date:
             raise HTTPException(422, detail="Missing department, from, or to")
         collection = "1"
         pipeline = [
@@ -854,7 +901,7 @@ def explain_endpoint(
                 "range": {
                     "step": 1,
                     "unit": "day",
-                    "bounds": [datetime.fromisoformat(from_date), datetime.fromisoformat(to_date) + timedelta(days=1)]
+                    "bounds": [datetime.fromisoformat(f_date), datetime.fromisoformat(t_date) + timedelta(days=1)]
                 }
             }},
             {"$match": {"date_obj": {"$type": "date"}}},
@@ -943,12 +990,15 @@ def explain_endpoint(
             }},
             {"$sort": {"date": 1}}
         ]
-        explain = db.command({
-            "aggregate": 1,
-            "pipeline": pipeline,
-            "explain": True,
-            "cursor": {}
-        })
+        cmd = SON([
+            ("explain", SON([
+                ("aggregate", 1),
+                ("pipeline", pipeline),
+                ("cursor", {})
+            ])),
+            ("verbosity", "executionStats")
+        ])
+        explain = db.command(cmd)
 
     # Safely serialize explain output
     explain = json.loads(json_util.dumps(explain))
@@ -1081,6 +1131,10 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         old_v = rec.get(k)
         if k in ("punch_in", "punch_out") and old_v is not None:
             old_v = make_aware(old_v)
+        elif k == "half_day" and old_v is None:
+            old_v = False
+        elif k in ("late_minutes", "overtime_minutes") and old_v is None:
+            old_v = 0
             
         if old_v != v:
             changes[k] = {"from": old_v, "to": v}
@@ -1096,8 +1150,16 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         "changes": changes
     }
     
+    history_len = len(rec.get("history") or [])
+    if history_len == 0:
+        history_filter = {"$or": [{"history": {"$size": 0}}, {"history": {"$exists": False}}]}
+    else:
+        history_filter = {"history": {"$size": history_len}}
+        
+    query_filter = {"_id": rec["_id"], **history_filter}
+    
     updated = db.attendance_logs.find_one_and_update(
-        {"_id": rec["_id"], "history": {"$size": len(rec.get("history", []))}},
+        query_filter,
         {
             "$set": updates,
             "$push": {"history": history_entry}
@@ -1109,3 +1171,4 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         raise HTTPException(409, detail="Concurrent regularization detected")
         
     return format_attendance_doc(updated)
+

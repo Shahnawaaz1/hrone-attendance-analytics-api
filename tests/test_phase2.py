@@ -32,15 +32,13 @@ def setup_employee(client, emp_code, shift_start, shift_end):
 def test_punch_out_success(client):
     setup_employee(client, "EMP_OUT_01", "09:30", "18:30")
     
-    # punch in at 10:00 (1783314000000 ms = some date 10:00 UTC, actually let's just use known epoch)
-    # let's just use relative times
-    import time
-    now_ms = int(time.time() * 1000)
+    # 2026-07-06 10:30:00 IST (05:00:00 UTC) = 1783314000000 ms
+    deterministic_ms = 1783314000000
     
-    in_res = client.post("/attendance/punch-in", json={"emp_code": "EMP_OUT_01", "punched_at": now_ms})
+    in_res = client.post("/attendance/punch-in", json={"emp_code": "EMP_OUT_01", "punched_at": deterministic_ms})
     assert in_res.status_code == 201
     
-    out_res = client.post("/attendance/punch-out", json={"emp_code": "EMP_OUT_01", "punched_at": now_ms + 4*3600*1000})
+    out_res = client.post("/attendance/punch-out", json={"emp_code": "EMP_OUT_01", "punched_at": deterministic_ms + 4*3600*1000})
     assert out_res.status_code == 200
     data = out_res.json()
     assert data["work_hours"] == 4.0
@@ -54,12 +52,11 @@ def test_punch_out_missing_punch_in(client):
 
 def test_punch_out_duplicate(client):
     setup_employee(client, "EMP_OUT_03", "09:30", "18:30")
-    import time
-    now_ms = int(time.time() * 1000)
-    client.post("/attendance/punch-in", json={"emp_code": "EMP_OUT_03", "punched_at": now_ms})
-    client.post("/attendance/punch-out", json={"emp_code": "EMP_OUT_03", "punched_at": now_ms + 4*3600*1000})
+    deterministic_ms = 1783314000000
+    client.post("/attendance/punch-in", json={"emp_code": "EMP_OUT_03", "punched_at": deterministic_ms})
+    client.post("/attendance/punch-out", json={"emp_code": "EMP_OUT_03", "punched_at": deterministic_ms + 4*3600*1000})
     
-    out_res_dup = client.post("/attendance/punch-out", json={"emp_code": "EMP_OUT_03", "punched_at": now_ms + 5*3600*1000})
+    out_res_dup = client.post("/attendance/punch-out", json={"emp_code": "EMP_OUT_03", "punched_at": deterministic_ms + 5*3600*1000})
     assert out_res_dup.status_code == 409
 
 def test_overnight_shift_and_overtime(client):
@@ -82,10 +79,9 @@ def test_overnight_shift_and_overtime(client):
 def test_half_up_rounding(client):
     setup_employee(client, "EMP_ROUND", "09:30", "18:30")
     # 4 hours and 45 seconds = 4.0125 hours -> round half up -> 4.01
-    import time
-    now_ms = int(time.time() * 1000)
-    client.post("/attendance/punch-in", json={"emp_code": "EMP_ROUND", "punched_at": now_ms})
-    out_res = client.post("/attendance/punch-out", json={"emp_code": "EMP_ROUND", "punched_at": now_ms + (4*3600 + 45)*1000})
+    deterministic_ms = 1783314000000
+    client.post("/attendance/punch-in", json={"emp_code": "EMP_ROUND", "punched_at": deterministic_ms})
+    out_res = client.post("/attendance/punch-out", json={"emp_code": "EMP_ROUND", "punched_at": deterministic_ms + (4*3600 + 45)*1000})
     assert out_res.json()["work_hours"] == 4.01
 
 def test_regularize_valid_correction(client):
