@@ -24,8 +24,16 @@ This project provides a robust, high-performance RESTful API for managing and an
 
 3. **Database Indexes**:
    The application idempotently creates all necessary MongoDB compound and unique indexes during FastAPI startup (`lifespan` handler):
-   - `employees`: unique index on `emp_code`, single-field index on `joined_on`.
-   - `attendance_logs`: unique compound index on `(emp_code, date)`, compound index on `(date: -1, emp_code: 1)` to eliminate in-memory sorting on attendance listings.
+   - `employees`:
+     - `emp_code`: Unique index enforcing employee identifier uniqueness.
+     - `department`: Single-field index for department filtering.
+     - `joined_on`: Single-field index optimizing headcount active-date cutoffs.
+     - `(department, joined_on)`: Compound index optimizing department trend and summary joins.
+   - `attendance_logs`:
+     - `(emp_code, date)`: Unique compound index preventing duplicate daily check-ins.
+     - `(date: -1, emp_code: 1)`: Compound index eliminating collection scans and in-memory sorting on attendance listings.
+     - `date`: Single-field index for date-range queries.
+     - `(date, late_minutes)`: Compound index accelerating late leaderboard date filtering and aggregation.
 
 4. **Sample Data (Optional)**:
    To populate the database with initial sample records:

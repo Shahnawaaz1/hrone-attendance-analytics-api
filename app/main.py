@@ -424,8 +424,23 @@ def department_summary(
             "emp_duty": {
                 "$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}
             },
-            "emp_work_hours": {
-                "$push": {"$cond": [{"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]}, "$logs.work_hours", "$$REMOVE"]}
+            "emp_work_hours_sum": {
+                "$sum": {
+                    "$cond": [
+                        {"$and": [{"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]}, {"$ne": ["$logs.work_hours", None]}]},
+                        "$logs.work_hours",
+                        0
+                    ]
+                }
+            },
+            "emp_work_hours_count": {
+                "$sum": {
+                    "$cond": [
+                        {"$and": [{"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]}, {"$ne": ["$logs.work_hours", None]}]},
+                        1,
+                        0
+                    ]
+                }
             }
         }},
         {"$group": {
@@ -436,7 +451,17 @@ def department_summary(
             "total_late_minutes": {"$sum": "$emp_late_mins"},
             "leave_count": {"$sum": "$emp_leave"},
             "on_duty_count": {"$sum": "$emp_duty"},
-            "all_work_hours": {"$push": "$emp_work_hours"}
+            "total_work_hours": {"$sum": "$emp_work_hours_sum"},
+            "total_work_records": {"$sum": "$emp_work_hours_count"}
+        }},
+        {"$addFields": {
+            "avg_work_hours": {
+                "$cond": [
+                    {"$gt": ["$total_work_records", 0]},
+                    {"$divide": ["$total_work_hours", "$total_work_records"]},
+                    None
+                ]
+            }
         }},
         {"$sort": {"_id": 1}}
     ]
@@ -444,15 +469,10 @@ def department_summary(
     res = list(db.employees.aggregate(pipeline))
     items = []
     for r in res:
-        # compute average work hours
-        wh_list = []
-        for emp_hrs in r.get("all_work_hours", []):
-            wh_list.extend([h for h in emp_hrs if h is not None])
-            
+        avg_raw = r.get("avg_work_hours")
         avg_wh = None
-        if wh_list:
-            avg = sum(wh_list) / len(wh_list)
-            avg_wh = float(Decimal(str(avg)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        if avg_raw is not None:
+            avg_wh = float(Decimal(str(avg_raw)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
             
         items.append({
             "department": r["_id"],
@@ -817,8 +837,23 @@ def explain_endpoint(
                 "emp_duty": {
                     "$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}
                 },
-                "emp_work_hours": {
-                    "$push": {"$cond": [{"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]}, "$logs.work_hours", "$$REMOVE"]}
+                "emp_work_hours_sum": {
+                    "$sum": {
+                        "$cond": [
+                            {"$and": [{"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]}, {"$ne": ["$logs.work_hours", None]}]},
+                            "$logs.work_hours",
+                            0
+                        ]
+                    }
+                },
+                "emp_work_hours_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$and": [{"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]}, {"$ne": ["$logs.work_hours", None]}]},
+                            1,
+                            0
+                        ]
+                    }
                 }
             }},
             {"$group": {
@@ -829,7 +864,17 @@ def explain_endpoint(
                 "total_late_minutes": {"$sum": "$emp_late_mins"},
                 "leave_count": {"$sum": "$emp_leave"},
                 "on_duty_count": {"$sum": "$emp_duty"},
-                "all_work_hours": {"$push": "$emp_work_hours"}
+                "total_work_hours": {"$sum": "$emp_work_hours_sum"},
+                "total_work_records": {"$sum": "$emp_work_hours_count"}
+            }},
+            {"$addFields": {
+                "avg_work_hours": {
+                    "$cond": [
+                        {"$gt": ["$total_work_records", 0]},
+                        {"$divide": ["$total_work_hours", "$total_work_records"]},
+                        None
+                    ]
+                }
             }},
             {"$sort": {"_id": 1}}
         ]
